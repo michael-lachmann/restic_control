@@ -1,0 +1,5 @@
+pyobjc-core>=10.0
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-Quartz>=10.0     # QLPreviewPanel (Quick Look)
+pyobjc-framework-WebKit>=10.0     # embedded Backrest view
+keyring>=24                       # passwords in the macOS Keychain
