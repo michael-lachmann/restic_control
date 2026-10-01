@@ -4,7 +4,7 @@ Just to get it out of the way, the complete app was vibe coded.
 
 I'll start with what I say, below what Claude said.
 
-The point of the app is to make it easy to restore files from a restic repository on OSX. You can easily see all versions of a file, quick look the contents, and restore it.
+The point of the app is to make it easy to restore files from a restic repository on macOS. You can easily see all versions of a file, quick look the contents, and restore it.
 You can also look at directories - when a directory changed, and how it changed between snapshots.
 The app was written for small restores, similar to what you get from opening time machine on a folder. I wouldn't use it to restore your whole home directory. Maybe you can.
 
