@@ -910,6 +910,105 @@ class VersionsSource(NSObject):
         return NSColor.labelColor()
 
 
+def _register_webkit_blocks():
+    """Tell PyObjC the shape of WebKit's decision handlers before WebPolicy is defined:
+    a delegate method's signature is fixed when its class is created, and a block
+    without one can't be called ("cannot call block without a signature").  Importing
+    WebKit loads PyObjC's own metadata; registering it here as well makes this
+    independent of import order and PyObjC versions."""
+    try:
+        import WebKit  # noqa: F401
+    except ImportError:
+        pass
+    register = getattr(objc, "registerMetaDataForSelector", None)
+    if register is None:
+        return
+    handler = {"callable": {"retval": {"type": b"v"},
+                            "arguments": {0: {"type": b"^v"}, 1: {"type": b"q"}}}}
+    for sel in (b"webView:decidePolicyForNavigationAction:decisionHandler:",
+                b"webView:decidePolicyForNavigationResponse:decisionHandler:"):
+        try:
+            # argument 4 = the block (0 self, 1 _cmd, 2 web view, 3 action/response)
+            register(b"NSObject", sel, {"arguments": {4: handler}})
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
+_register_webkit_blocks()
+
+
+def decide(handler, policy):
+    """Answer a WebKit decision handler (1 = allow, 0 = cancel)."""
+    try:
+        handler(policy)
+    except TypeError:
+        # still no signature (unexpected PyObjC version): give the block one, try again
+        traceback.print_exc()
+        try:
+            handler.__block_signature__ = objc.splitSignature(b"v^vq")
+            handler(policy)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
+class WebPolicy(NSObject):
+    """Navigation / UI delegate of a web view: Backrest's own pages stay in the Backrest
+    tab, "new tab" links and other sites go to the links tab, other URL schemes go to
+    macOS, and downloads go to the default browser (which saves and shows them)."""
+
+    @objc.python_method
+    def setup(self, main, links_tab):
+        self.main, self.links_tab = main, links_tab
+        return self
+
+    @objc.python_method
+    def route(self, url, new_window):
+        """Where *url* (an NSURL) should open; returns True if this view should load it."""
+        text = url.absoluteString() if url is not None else ""
+        where = br.link_target(text, getattr(self.main, "backrestBase", ""), new_window,
+                               self.links_tab)
+        if where == "system":
+            NSWorkspace.sharedWorkspace().openURL_(url)
+            return False
+        if where == "links":
+            AppHelper.callAfter(self.main.openInLinksTab, url)
+            return False
+        return True
+
+    def webView_decidePolicyForNavigationAction_decisionHandler_(self, view, action, handler):
+        frame = action.targetFrame()
+        main_frame = frame is not None and frame.isMainFrame()
+        if not main_frame and frame is not None:
+            decide(handler, 1)                    # subframes (iframes) load where they are
+            return
+        try:
+            ok = self.route(action.request().URL(), frame is None)
+        except Exception:  # noqa: BLE001 — never leave WebKit waiting for an answer
+            traceback.print_exc()
+            ok = True
+        decide(handler, 1 if ok else 0)
+
+    def webView_decidePolicyForNavigationResponse_decisionHandler_(self, view, response, handler):
+        if response.canShowMIMEType():
+            decide(handler, 1)
+            return
+        url = response.response().URL()           # a download: let the browser save it
+        if url is not None:
+            NSWorkspace.sharedWorkspace().openURL_(url)
+        decide(handler, 0)
+
+    def webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures_(
+            self, view, config, action, features):
+        url = action.request().URL()             # target=_blank / window.open
+        if self.route(url, True):
+            view.loadRequest_(action.request())   # (links tab: open in the same tab)
+        return None
+
+    def webView_didFinishNavigation_(self, view, navigation):
+        if self.links_tab:
+            self.main.linksPageChanged(view)
+
+
 # ============================================================================
 # Main window controller
 # ============================================================================
@@ -1153,6 +1252,9 @@ class MainController(NSObject):
             from WebKit import WKWebView, WKWebViewConfiguration
             self.webView = WKWebView.alloc().initWithFrame_configuration_(
                 holder.bounds(), WKWebViewConfiguration.alloc().init())
+            self.webPolicy = WebPolicy.alloc().init().setup(self, links_tab=False)
+            self.webView.setNavigationDelegate_(self.webPolicy)
+            self.webView.setUIDelegate_(self.webPolicy)
             self.webView.setAutoresizingMask_(WIDTH_HEIGHT)
             self.webView.setHidden_(True)
             holder.addSubview_(self.webView)
@@ -2832,6 +2934,104 @@ class MainController(NSObject):
         run_async(work, done, fail)
 
     # ----------------------------------------------------------- Backrest --
+    # ------------------------------------------- links tab (next to Backrest) --
+    @objc.python_method
+    def openInLinksTab(self, url):
+        """Show *url* in the tab to the right of Manage (Backrest), creating it once."""
+        if getattr(self, "linksItem", None) is None:
+            self.buildLinksTab()
+        if self.linksView is None:                # no WebKit: fall back to the browser
+            NSWorkspace.sharedWorkspace().openURL_(url)
+            return
+        self.linksView.loadRequest_(NSURLRequest.requestWithURL_(url))
+        self.linksItem.setLabel_(url.host() or "Link")
+        self.tabs.selectTabViewItem_(self.linksItem)
+
+    @objc.python_method
+    def buildLinksTab(self):
+        container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 1000, 600))
+        back = NSButton.buttonWithTitle_target_action_("‹", self, "linksBack:")
+        fwd = NSButton.buttonWithTitle_target_action_("›", self, "linksForward:")
+        reload_ = NSButton.buttonWithTitle_target_action_("Reload", self, "linksReload:")
+        browser = NSButton.buttonWithTitle_target_action_("Open in Browser", self, "linksInBrowser:")
+        close = NSButton.buttonWithTitle_target_action_("Close Tab", self, "linksClose:")
+        self.linksAddress = label("")
+        self.linksAddress.setTextColor_(NSColor.secondaryLabelColor())
+        self.linksAddress.setContentCompressionResistancePriority_forOrientation_(1, 0)
+        spacer = NSView.alloc().init()
+        spacer.setContentHuggingPriority_forOrientation_(1, 0)
+        bar = NSStackView.stackViewWithViews_([back, fwd, reload_, self.linksAddress, spacer,
+                                               browser, close])
+        holder = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 1000, 560))
+        try:
+            from WebKit import WKWebView, WKWebViewConfiguration
+            # the default configuration shares cookies (e.g. a Backrest login) with the
+            # Backrest tab
+            self.linksView = WKWebView.alloc().initWithFrame_configuration_(
+                holder.bounds(), WKWebViewConfiguration.alloc().init())
+            self.linksPolicy = WebPolicy.alloc().init().setup(self, links_tab=True)
+            self.linksView.setNavigationDelegate_(self.linksPolicy)
+            self.linksView.setUIDelegate_(self.linksPolicy)
+            self.linksView.setAutoresizingMask_(WIDTH_HEIGHT)
+            holder.addSubview_(self.linksView)
+        except ImportError:
+            self.linksView = None
+        for v in (bar, holder):
+            v.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            container.addSubview_(v)
+        NSLayoutConstraint.activateConstraints_([
+            bar.topAnchor().constraintEqualToAnchor_constant_(container.topAnchor(), 8),
+            bar.leadingAnchor().constraintEqualToAnchor_constant_(container.leadingAnchor(), 8),
+            bar.trailingAnchor().constraintEqualToAnchor_constant_(container.trailingAnchor(), -8),
+            holder.topAnchor().constraintEqualToAnchor_constant_(bar.bottomAnchor(), 8),
+            holder.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()),
+            holder.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()),
+            holder.bottomAnchor().constraintEqualToAnchor_(container.bottomAnchor()),
+        ])
+        item = NSTabViewItem.alloc().initWithIdentifier_("links")
+        item.setLabel_("Link")
+        item.setView_(container)
+        self.tabs.addTabViewItem_(item)
+        self.linksItem = item
+
+    @objc.python_method
+    def linksPageChanged(self, view):
+        """A page finished loading in the links tab: its title becomes the tab's label."""
+        if view is not getattr(self, "linksView", None) or self.linksItem is None:
+            return
+        url = view.URL()
+        title = (view.title() or "") or (url.host() if url else "") or "Link"
+        self.linksItem.setLabel_(title if len(title) <= 32 else title[:31] + "…")
+        self.linksAddress.setStringValue_(url.absoluteString() if url else "")
+
+    def linksBack_(self, sender):
+        if self.linksView is not None and self.linksView.canGoBack():
+            self.linksView.goBack()
+
+    def linksForward_(self, sender):
+        if self.linksView is not None and self.linksView.canGoForward():
+            self.linksView.goForward()
+
+    def linksReload_(self, sender):
+        if self.linksView is not None:
+            self.linksView.reload()
+
+    def linksInBrowser_(self, sender):
+        url = self.linksView.URL() if self.linksView is not None else None
+        if url is not None:
+            NSWorkspace.sharedWorkspace().openURL_(url)
+
+    def linksClose_(self, sender):
+        if getattr(self, "linksItem", None) is None:
+            return
+        if self.linksView is not None:
+            self.linksView.stopLoading()
+            self.linksView.loadHTMLString_baseURL_("", None)
+        self.tabs.selectTabViewItemWithIdentifier_("manage")
+        self.tabs.removeTabViewItem_(self.linksItem)
+        self.linksItem = None
+        self.linksView = None
+
     def tabView_didSelectTabViewItem_(self, tabs, item):
         if item.identifier() == "manage" and not self.webLoaded:
             self.backrestConnect_(None)
@@ -2846,6 +3046,7 @@ class MainController(NSObject):
 
     @objc.python_method
     def showBackrestPage(self, url):
+        self.backrestBase = url                   # links elsewhere go to the links tab
         self.brOverlay.setHidden_(True)
         if self.webView is not None:
             self.webView.setHidden_(False)

@@ -120,3 +120,21 @@ def test_wait_until_up(delay):
     threading.Thread(target=later, daemon=True).start()
     p = br.wait_until_up(f"http://127.0.0.1:{port}/", seconds=5, interval=0.2)
     assert p.is_backrest
+
+
+def test_link_targets():
+    from resticcontrol.backrest import link_target, same_origin
+    base = "http://127.0.0.1:9898"
+    assert same_origin("http://127.0.0.1:9898/#/plan/home", base)
+    assert not same_origin("http://127.0.0.1:9899/", base)
+    assert same_origin("https://example.org/x", "https://example.org:443")
+    # in the Backrest tab: its own pages stay, everything else goes to the links tab
+    assert link_target("http://127.0.0.1:9898/#/repo/x", base, False, False) == "here"
+    assert link_target("http://127.0.0.1:9898/#/repo/x", base, True, False) == "links"
+    assert link_target("https://restic.readthedocs.io/", base, False, False) == "links"
+    assert link_target("https://github.com/garethgeorge/backrest", base, True, False) == "links"
+    assert link_target("mailto:me@example.org", base, False, False) == "system"
+    assert link_target("about:blank", base, False, False) == "here"
+    # the links tab is a small browser: everything web stays in it
+    assert link_target("https://github.com/", base, True, True) == "here"
+    assert link_target("http://127.0.0.1:9898/", base, False, True) == "here"

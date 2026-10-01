@@ -226,3 +226,37 @@ def start_local(inst: Installation) -> str:
                          start_new_session=True)                   # keeps running after we quit
         return "Started Backrest (until you log out; it has no service set up)"
     raise BackrestError(f"Don't know how to start Backrest installed via {inst.method}")
+
+
+# ----------------------------------------------------------------------------
+# links clicked inside the embedded Backrest page
+# ----------------------------------------------------------------------------
+
+def _origin(url: str) -> tuple:
+    u = urlsplit(url or "")
+    scheme = (u.scheme or "").lower()
+    port = u.port or {"http": 80, "https": 443}.get(scheme)
+    return scheme, (u.hostname or "").lower(), port
+
+
+def same_origin(url: str, base: str) -> bool:
+    return bool(base) and _origin(url) == _origin(base)
+
+
+def link_target(url: str, base: str, new_window: bool, in_links_tab: bool) -> str:
+    """Where a navigation inside a web view should go:
+
+    "here"    load it in the view it happened in
+    "links"   load it in the separate links tab (the Backrest tab keeps showing Backrest)
+    "system"  hand it to macOS (mailto:, other apps' URL schemes)
+    """
+    scheme = urlsplit(url or "").scheme.lower()
+    if scheme in ("about", "data", "blob", "javascript", ""):
+        return "here"
+    if scheme not in ("http", "https"):
+        return "system"
+    if in_links_tab:
+        return "here"                       # the links tab is a small browser of its own
+    if new_window or not same_origin(url, base):
+        return "links"                      # "new tab" links and other sites
+    return "here"                           # Backrest's own pages stay in its tab
