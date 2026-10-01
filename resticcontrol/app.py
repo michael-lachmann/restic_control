@@ -57,6 +57,7 @@ KEY_DOWN = 10                        # NSEventTypeKeyDown
 SPINNING = 1                         # NSProgressIndicatorStyleSpinning
 LOCAL_FILES = "This Mac (local files)"
 POLL_SECONDS = 60                    # how often to look for new backups
+DISK_CHECK_SECONDS = 3               # how often to check the open folders on the left
 ALL_HOSTS = "All hosts"
 
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -75,6 +76,13 @@ def run_async(fn, on_done, on_error=None):
             return
         AppHelper.callAfter(on_done, result)
     _executor.submit(work)
+
+
+def dir_mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
 
 
 def has_full_disk_access():
@@ -476,6 +484,7 @@ class OutlineSource(NSObject):
                 if is_root:
                     nodes = [local_node(p, name=p) for p in roots]
                     return [n for n in nodes if n is not None]
+                it.dirMtime = dir_mtime(it.path)          # before listing: never miss a change
                 return list_local(it.path)
         else:
             def work():
@@ -533,6 +542,79 @@ class OutlineSource(NSObject):
     @objc.python_method
     def reloadChildren(self, it):
         self.main.outline.reloadItem_reloadChildren_(None if it is self.root else it, True)
+
+    # -- keeping open folders current ------------------------------------------
+    @objc.python_method
+    def openFolders(self):
+        """Loaded folders whose contents are on screen: expanded ones (local mode)."""
+        ov, out = self.main.outline, []
+
+        def walk(it):
+            for c in it.children or []:
+                if c.is_dir and c.allEntries is not None and ov.isItemExpanded_(c):
+                    out.append(c)
+                    walk(c)
+        walk(self.root)
+        return out
+
+    @objc.python_method
+    def refreshOpen(self, force=False):
+        """Re-list the open folders that changed on disk (or all open ones if *force*,
+        e.g. after a restore) and update the tree in place: a new file appears, a
+        deleted one goes, everything else (open folders, selection, scroll) stays.
+        A folder's modification time changes whenever an item is added, removed or
+        renamed in it, so the periodic check is one stat() per open folder."""
+        main = self.main
+        if main.singleSnapshot() is not None or getattr(self, "refreshing", False):
+            return
+        folders = self.openFolders()
+        if not folders:
+            return
+        generation = main.treeGeneration
+        self.refreshing = True
+
+        def work():
+            out = []
+            for it in folders:
+                m = dir_mtime(it.path)
+                if force or m != getattr(it, "dirMtime", None):
+                    out.append((it, m, list_local(it.path)))
+            return out
+
+        def done(results):
+            self.refreshing = False
+            if generation != main.treeGeneration or not results:
+                return
+            changed = []
+            for it, m, nodes in results:
+                it.dirMtime = m
+                old = [(e.node.name, e.node.type, e.node.size, e.node.mtime)
+                       for e in it.allEntries or []]
+                new = [(n.name, n.type, n.size, n.mtime) for n in nodes]
+                if old != new:
+                    it.allEntries = [MergedEntry(node=n, newest=None) for n in nodes]
+                    it.children = self.sortItems(self.itemsFor(it, self.visible(it.allEntries)))
+                    changed.append(it)
+            if not changed:
+                return
+            ov = main.outline
+            selected = main.selectedOutlineItems()
+            self.restoringSelection = True
+            try:
+                for it in changed:
+                    ov.reloadItem_reloadChildren_(it, True)
+                rows = NSMutableIndexSet.indexSet()
+                for it in selected:
+                    r = ov.rowForItem_(it)
+                    if r >= 0:
+                        rows.addIndex_(r)
+                ov.selectRowIndexes_byExtendingSelection_(rows, False)
+            finally:
+                self.restoringSelection = False
+
+        def fail(e):
+            self.refreshing = False
+        run_async(work, done, fail)
 
 
 # ============================================================================
@@ -1133,6 +1215,9 @@ class MainController(NSObject):
         from Foundation import NSTimer
         self.pollTimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             POLL_SECONDS, self, "pollSnapshots:", None, True)
+        # …and the open folders on the left follow what happens on disk
+        self.diskTimer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            DISK_CHECK_SECONDS, self, "checkOpenFolders:", None, True)
         run_async(self.journal.recover, self.reportRecovered)
 
     @objc.python_method
@@ -1533,7 +1618,7 @@ class MainController(NSObject):
         name = item.name if item.name != item.path else (posixpath.basename(path) or path)
         node = Node(name=name, path=path, type="dir", size=None, mtime=None)
         covering = snapshots_for_folder(snaps, path)
-        self.pathLabel.setStringValue_(f"Versions of {path}/ — open ▸ a version to see what changed")
+        self.pathLabel.setStringValue_(f"Versions of {path}/  —  click the triangle next to a version to see what changed since the version below it")
 
         # quiet refresh: versions that are still there keep their Changes text meanwhile
         known = (self.pendingState or {}).get("changes", {}) if quiet else {}
@@ -1752,6 +1837,10 @@ class MainController(NSObject):
     def refresh_(self, sender):
         if self.restic:
             self.checkForNewBackups(force=True)
+
+    def checkOpenFolders_(self, timer):
+        if self.restic is not None and not self.pendingReveal:
+            self.outlineSource.refreshOpen()
 
     def pollSnapshots_(self, timer):
         if self.restic is not None and not self.polling and not self.restoresRunning:
@@ -2561,6 +2650,7 @@ class MainController(NSObject):
     @objc.python_method
     def restoreEnded(self):
         self.restoresRunning = max(0, self.restoresRunning - 1)
+        self.outlineSource.refreshOpen(force=True)     # show what was restored on the left
         if self.restoresRunning == 0 and self._sleepActivity is not None:
             from Foundation import NSProcessInfo
             NSProcessInfo.processInfo().endActivity_(self._sleepActivity)

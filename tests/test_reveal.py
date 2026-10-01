@@ -79,3 +79,40 @@ def test_reveal_outside_backup(app, tmp_path, monkeypatch):
     m, finish, selected, alerts, _ = _world(app, tmp_path, monkeypatch)
     m.revealPath("/etc/hosts"); finish()
     assert selected == [] and alerts == ["Not in the backup"]
+
+
+def test_open_folders_follow_the_disk(app, tmp_path, monkeypatch):
+    """A file restored next to its original (or created / deleted by anyone) shows up in
+    the open folders on the left; nothing else in the tree changes."""
+    from resticcontrol.backend import MergedEntry, list_local, local_node
+    monkeypatch.setattr(app, "run_async", lambda fn, done, fail=None: done(fn()))
+    d = tmp_path / "docs"
+    (d / "sub").mkdir(parents=True)
+    (d / "a.txt").write_text("a")
+    m = app.MainController()
+    m.outline, m.restic, m.treeGeneration = MagicMock(), object(), 0
+    m.showHidden, m.foldersFirst, m.leftSort = False, True, ("name", True)
+    m.singleSnapshot = lambda: None
+    m.selectedOutlineItems = lambda: []
+    m.outline.isItemExpanded_.return_value = True
+    src = app.OutlineSource().setup(m)
+    folder = app.make_item(str(d), "docs", MergedEntry(node=local_node(str(d)), newest=None))
+    src.root.children = [folder]
+    folder.dirMtime = app.dir_mtime(str(d))
+    src.setChildren(folder, [MergedEntry(node=n, newest=None) for n in list_local(str(d))])
+    a_item = folder.children[1]
+    assert [c.name for c in folder.children] == ["sub", "a.txt"]
+    m.outline.reset_mock()
+    src.refreshOpen()                                   # nothing changed: no reload
+    assert not m.outline.reloadItem_reloadChildren_.called
+    (d / "a (restored 2026-09-30).txt").write_text("old a")
+    os.utime(d, ns=(folder.dirMtime + 10**9, folder.dirMtime + 10**9))   # coarse clocks
+    src.refreshOpen()
+    assert [c.name for c in folder.children] == ["sub", "a (restored 2026-09-30).txt", "a.txt"]
+    assert folder.children[2] is a_item                 # same item: selection/expansion survive
+    m.outline.reloadItem_reloadChildren_.assert_called_with(folder, True)
+    # after a restore every open folder is re-listed, whatever its modification time
+    (d / "b.txt").write_text("b")
+    os.utime(d, ns=(folder.dirMtime, folder.dirMtime))
+    src.refreshOpen(force=True)
+    assert "b.txt" in [c.name for c in folder.children]
