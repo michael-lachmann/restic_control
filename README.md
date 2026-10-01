@@ -8,7 +8,11 @@ The point of the app is to make it easy to restore files from a restic repositor
 You can also look at directories - when a directory changed, and how it changed between snapshots.
 The app was written for small restores, similar to what you get from opening time machine on a folder. I wouldn't use it to restore your whole home directory. Maybe you can.
 
-![restic_control screenshot](docs/Screenshot1.png)
+
+
+https://github.com/user-attachments/assets/7f3b88d9-7473-47ff-9bc7-78040bbc4089
+
+
 
 It also provides a webview into backrest, just so that everything is in one place.
 
